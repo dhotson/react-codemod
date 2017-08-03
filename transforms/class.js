@@ -548,39 +548,99 @@ module.exports = (file, api, options) => {
     return [j.identifier('props')];
   };
 
-  const createConstructor = (getInitialState) => {
-    const initialStateAST = j(getInitialState);
+  const createConstructor = (rawProperties, methodsToBind, getInitialState) => {
     let hasContextAccess = false;
+    let statements = [];
 
-    if (
-      initialStateAST.find(j.MemberExpression, { // has `this.context` access
-        object: {type: 'ThisExpression'},
-        property: {type: 'Identifier', name: 'context'},
-      }).size() ||
-      initialStateAST.find(j.CallExpression, { // a direct method call `this.x()`
-        callee: {
-          type: 'MemberExpression',
+    if (getInitialState) {
+      const initialStateAST = j(getInitialState);
+      if (
+        initialStateAST.find(j.MemberExpression, { // has `this.context` access
           object: {type: 'ThisExpression'},
-        },
-      }).size() ||
-      initialStateAST.find(j.MemberExpression, { // `this` is referenced alone
-        object: {type: 'ThisExpression'},
-      }).size() !== initialStateAST.find(j.ThisExpression).size()
-    ) {
-      hasContextAccess = true;
+          property: {type: 'Identifier', name: 'context'},
+        }).size() ||
+        initialStateAST.find(j.CallExpression, { // a direct method call `this.x()`
+          callee: {
+            type: 'MemberExpression',
+            object: {type: 'ThisExpression'},
+          },
+        }).size() ||
+        initialStateAST.find(j.MemberExpression, { // `this` is referenced alone
+          object: {type: 'ThisExpression'},
+        }).size() !== initialStateAST.find(j.ThisExpression).size()
+      ) {
+        hasContextAccess = true;
+      }
+      updatePropsAndContextAccess(getInitialState);
     }
 
-    updatePropsAndContextAccess(getInitialState);
     const constructorArgs = createConstructorArgs(hasContextAccess);
 
-    return [
-      createMethodDefinition({
-        key: j.identifier('constructor'),
-        value: j.functionExpression(
-          null,
-          constructorArgs,
-          j.blockStatement(
-            [].concat(
+    if (getInitialState) {
+      statements = statements.concat(
+        inlineGetInitialState(getInitialState)
+      )
+    }
+
+    if (rawProperties.length > 0) {
+      rawProperties.filter(p => isPrimProperty(p)).forEach(p => {
+        statements.push(
+          j.expressionStatement(
+            j.assignmentExpression(
+              '=',
+              j.memberExpression(
+                j.thisExpression(),
+                j.identifier(p.key.name),
+                false
+              ),
+              p.value
+            )
+          )
+        )
+      });
+    }
+
+
+    if (methodsToBind.length > 0) {
+      methodsToBind.forEach(m => {
+        statements.push(
+          j.expressionStatement(
+            j.assignmentExpression(
+              '=',
+              j.memberExpression(
+                j.thisExpression(),
+                j.identifier(m),
+                false
+              ),
+
+              j.memberExpression(
+                j.memberExpression(
+                  j.thisExpression(),
+                  j.identifier(m),
+                  false
+                ),
+                j.callExpression(
+                  j.identifier('bind'),
+                  [
+                    j.thisExpression()
+                  ]
+                ),
+                false
+              ),
+            )
+          )
+        )
+      });
+    }
+
+    if (statements.length > 0) {
+      return [
+        createMethodDefinition({
+          key: j.identifier('constructor'),
+          value: j.functionExpression(
+            null,
+            constructorArgs,
+            j.blockStatement(
               [
                 j.expressionStatement(
                   j.callExpression(
@@ -588,13 +648,15 @@ module.exports = (file, api, options) => {
                     constructorArgs
                   )
                 ),
+                ...statements
               ],
-              inlineGetInitialState(getInitialState)
             )
-          )
-        ),
-      }),
-    ];
+          ),
+        }),
+      ];
+    } else {
+      return [];
+    }
   };
 
   const createArrowFunctionExpression = fn => {
@@ -929,41 +991,49 @@ module.exports = (file, api, options) => {
     let maybeConstructor = [];
     let maybeFlowStateAnnotation = []; // we only need this when we do `this.state = ...`
 
-    if (isInitialStateLiftable(getInitialState)) {
-      if (getInitialState) {
-        initialStateProperty.push(convertInitialStateToClassProperty(getInitialState));
-      }
-    } else {
-      maybeConstructor = createConstructor(getInitialState);
-      if (shouldTransformFlow) {
-        let stateType = j.typeAnnotation(
-          j.existsTypeAnnotation()
-        );
 
-        if (getInitialState.value.returnType) {
-          stateType = getInitialState.value.returnType;
-        }
-
-        maybeFlowStateAnnotation.push(j.classProperty(
-          j.identifier('state'),
-          null,
-          stateType,
-          false
-        ));
+    const methodsToBind = rawProperties.map(prop => {
+      if (AUTOBIND_IGNORE_KEYS.hasOwnProperty(prop.key.name)) {
+        return false;
       }
+      // if (/^render[A-Z]/.test(prop.key.name)) {
+      //   return false
+      // }
+      if (isFunctionExpression(prop)) {
+        return prop.key.name;
+      }
+    }).filter(x => x);
+
+    maybeConstructor = createConstructor(rawProperties, methodsToBind, getInitialState);
+    if (shouldTransformFlow) {
+      let stateType = j.typeAnnotation(
+        j.existsTypeAnnotation()
+      );
+
+      if (getInitialState.value.returnType) {
+        stateType = getInitialState.value.returnType;
+      }
+
+      maybeFlowStateAnnotation.push(j.classProperty(
+        j.identifier('state'),
+        null,
+        stateType,
+        false
+      ));
     }
 
     const propertiesAndMethods = rawProperties.map(prop => {
       if (isPrimPropertyWithTypeAnnotation(prop)) {
         return createClassPropertyWithType(prop);
       } else if (isPrimProperty(prop)) {
-        return createClassProperty(prop);
+        return false;
       } else if (AUTOBIND_IGNORE_KEYS.hasOwnProperty(prop.key.name)) {
         return createMethodDefinition(prop);
       }
 
-      return createArrowProperty(prop);
-    });
+      // TODO dhotson
+      return createMethodDefinition(prop);
+    }).filter(x => x);
 
     const flowPropsAnnotation = shouldTransformFlow ?
       createFlowAnnotationsFromPropTypesProperties(
@@ -995,36 +1065,6 @@ module.exports = (file, api, options) => {
       )
     ), {comments});
   };
-
-  const createStaticClassProperty = staticProperty => {
-    if (staticProperty.value.type === 'FunctionExpression') {
-      return withComments(j.methodDefinition(
-        'method',
-        j.identifier(staticProperty.key.name),
-        staticProperty.value,
-        true
-      ), staticProperty);
-    }
-
-    if (staticProperty.value.type === 'TypeCastExpression') {
-      return withComments(j.classProperty(
-        j.identifier(staticProperty.key.name),
-        staticProperty.value.expression,
-        staticProperty.value.typeAnnotation,
-        true
-      ), staticProperty);
-    }
-
-    return withComments(j.classProperty(
-      j.identifier(staticProperty.key.name),
-      staticProperty.value,
-      null,
-      true
-    ), staticProperty);
-  };
-
-  const createStaticClassProperties = statics =>
-    statics.map(createStaticClassProperty);
 
   const getComments = classPath => {
     if (classPath.value.comments) {
@@ -1082,23 +1122,47 @@ module.exports = (file, api, options) => {
       path = classPath.parentPath.parentPath.parentPath;
     }
 
-    const staticProperties = createStaticClassProperties(statics);
     const baseClassName =
       pureRenderMixinPathAndBinding &&
       ReactUtils.directlyHasSpecificMixins(classPath, [pureRenderMixinPathAndBinding.binding]) ?
         'PureComponent' :
         'Component';
 
-    j(path).replaceWith(
-      createESClass(
-        name,
-        baseClassName,
-        staticProperties,
-        getInitialState,
-        properties,
-        comments
-      )
-    );
+    let t = j(path).replaceWith([
+        createESClass(
+          name,
+          baseClassName,
+          [], // staticProperties,
+          getInitialState,
+          properties,
+          comments
+        ),
+    ]);
+
+    statics.filter(x => x).map(p => {
+      let x = path;
+      
+      if (x.parentPath && x.parentPath.value.type == 'ExportNamedDeclaration') {
+        x = x.parentPath;
+      }
+
+      j(x).insertAfter(
+        withComments(
+          j.expressionStatement(
+            j.assignmentExpression(
+              '=',
+              j.memberExpression(
+                j.identifier(name),
+                j.identifier(p.key.name),
+                false
+              ),
+              p.value,
+            )
+          ),
+          p
+        )
+      );
+    });
   };
 
   const addDisplayName = (displayName, specPath) => {
